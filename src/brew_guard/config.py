@@ -35,6 +35,8 @@ DEFAULT_CONFIG = {
     "attestation_check": False,
     "strict_attestation": False,
     "strict_no_check_casks": False,
+    "block_on_date_resolution_error": True,
+    "block_on_lockfile_error": True,
     "allowed": {},
 }
 
@@ -44,8 +46,19 @@ CONFIG_SCHEMA: dict[str, type] = {
     "attestation_check": bool,
     "strict_attestation": bool,
     "strict_no_check_casks": bool,
+    "block_on_date_resolution_error": bool,
+    "block_on_lockfile_error": bool,
     "allowed": dict,
 }
+
+
+class JsonFileError(RuntimeError):
+    """Raised when a persistent JSON state file cannot be trusted."""
+
+    def __init__(self, path: Path, reason: str):
+        self.path = path
+        self.reason = reason
+        super().__init__(f"{path}: {reason}")
 
 # ── Brew Detection ────────────────────────────────────────────────────
 _brew_path: str | None = None
@@ -79,14 +92,32 @@ def find_brew() -> str:
 
 
 # ── JSON I/O ──────────────────────────────────────────────────────────
-def load_json(path: Path) -> dict:
+def load_json(path: Path, *, invalid_ok: bool = False) -> dict:
     try:
-        return json.loads(path.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
+        raw = path.read_text()
+    except FileNotFoundError:
         return {}
+    except OSError as exc:
+        if invalid_ok:
+            return {}
+        raise JsonFileError(path, f"cannot be read ({exc})") from exc
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        if invalid_ok:
+            return {}
+        raise JsonFileError(path, f"contains invalid JSON ({exc.msg})") from exc
+
+    if not isinstance(data, dict):
+        if invalid_ok:
+            return {}
+        raise JsonFileError(path, "must contain a JSON object")
+    return data
 
 
 def save_json(path: Path, data: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
     tmp.rename(path)
@@ -97,12 +128,12 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def iso_to_epoch(iso: str) -> float:
+def iso_to_epoch(iso: str) -> float | None:
     try:
         clean = iso.replace("Z", "+00:00")
         return datetime.fromisoformat(clean).timestamp()
     except (ValueError, TypeError, AttributeError):
-        return 0
+        return None
 
 
 def epoch_now() -> float:

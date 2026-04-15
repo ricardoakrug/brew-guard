@@ -9,6 +9,7 @@ brew-guard sits between you and `brew`, intercepting `install` and `upgrade` com
 1. **Quarantine check** — queries GitHub for when the formula was last modified. If the change is too recent (default: 3 days), the install is blocked.
 2. **Hash tracking** — records SHA256 hashes of bottles, source tarballs, and formula files in a local lockfile. On upgrade, it detects hash changes and alerts you.
 3. **Audit logging** — every decision (pass, block, force-override) is logged to `~/.brew-guard/cache/audit.log`.
+4. **Strict failure handling** — if formula age or lockfile integrity cannot be verified, brew-guard blocks by default instead of silently degrading.
 
 All other brew commands (search, list, info, etc.) pass through transparently.
 
@@ -43,7 +44,7 @@ brew-guard:  Intercepts the command
              └─ Updates lockfile, passes through to real brew
 ```
 
-GitHub queries are cached for 1 hour to avoid rate limiting. The `gh` CLI handles authentication automatically.
+GitHub queries are cached for 1 hour to avoid rate limiting. The `gh` CLI handles authentication automatically. Read-only commands like `help` and plain brew passthroughs do not create `~/.brew-guard` state.
 
 ## Prerequisites
 
@@ -100,7 +101,7 @@ Setup will walk you through:
 | Command | Description |
 |---------|-------------|
 | `brew install <pkg>` | Install with quarantine + hash checks |
-| `brew upgrade [<pkg>]` | Upgrade with checks; quarantined packages are skipped |
+| `brew upgrade [<pkg>]` | Upgrade with the full verification pipeline; blocked packages are skipped in bulk mode |
 | `brew-guard setup` | Initialize lockfile with all currently installed packages |
 | `brew-guard status` | Show all tracked packages with age and quarantine status |
 | `brew-guard audit` | Re-check all installed packages for hash changes |
@@ -112,7 +113,7 @@ All other commands (e.g., `brew search`, `brew info`, `brew list`) pass through 
 
 ### Overrides
 
-- `--force` on any protected command bypasses quarantine and hash checks (logged)
+- `--force` on any protected command bypasses quarantine, hash, attestation, and verification-failure blocks (logged)
 - `brew-guard allow <pkg> --reason "..."` permanently whitelists a package
 
 ## Configuration
@@ -123,8 +124,10 @@ Stored at `~/.brew-guard/config.json`.
 |-----|------|---------|-------------|
 | `quarantine_days` | int | `3` | Days a formula must age before install is allowed |
 | `attestation_check` | bool | `false` | Verify Sigstore attestations for bottles |
-| `strict_attestation` | bool | `false` | Block on attestation failure (requires `attestation_check`) |
+| `strict_attestation` | bool | `false` | Block on attestation failure or timeout (requires `attestation_check`) |
 | `strict_no_check_casks` | bool | `false` | Block casks that have `sha256 :no_check` |
+| `block_on_date_resolution_error` | bool | `true` | Block when formula age cannot be verified |
+| `block_on_lockfile_error` | bool | `true` | Block when `lockfile.json` is invalid |
 | `allowed` | object | `{}` | Package allowlist with reasons |
 
 ```bash
@@ -143,6 +146,8 @@ brew-guard config
 | `~/.brew-guard/lockfile.json` | Package hashes and metadata |
 | `~/.brew-guard/cache/formula_dates.json` | TTL cache for GitHub queries |
 | `~/.brew-guard/cache/audit.log` | Audit trail of all decisions |
+
+If `config.json` is invalid JSON, brew-guard stops and asks you to repair or replace it. If `lockfile.json` is invalid, brew-guard blocks by default unless `block_on_lockfile_error=false`. If the date cache is invalid, brew-guard recreates it automatically.
 
 ## Uninstall
 

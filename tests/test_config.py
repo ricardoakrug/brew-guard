@@ -4,7 +4,10 @@ import json
 import os
 from unittest.mock import patch
 
+import pytest
+
 from brew_guard.config import (
+    JsonFileError,
     check_alias_in_rc,
     detect_shell,
     find_brew,
@@ -29,10 +32,17 @@ def test_load_json_missing(tmp_path):
     assert load_json(f) == {}
 
 
-def test_load_json_invalid(tmp_path):
+def test_load_json_invalid_raises(tmp_path):
     f = tmp_path / "bad.json"
     f.write_text("not json")
-    assert load_json(f) == {}
+    with pytest.raises(JsonFileError):
+        load_json(f)
+
+
+def test_load_json_invalid_ok(tmp_path):
+    f = tmp_path / "bad.json"
+    f.write_text("not json")
+    assert load_json(f, invalid_ok=True) == {}
 
 
 def test_save_json_roundtrip(tmp_path):
@@ -45,19 +55,24 @@ def test_save_json_roundtrip(tmp_path):
 def test_save_json_atomic(tmp_path):
     f = tmp_path / "out.json"
     save_json(f, {"a": 1})
-    # tmp file should not remain
     assert not (tmp_path / "out.tmp").exists()
+
+
+def test_save_json_creates_parent(tmp_path):
+    f = tmp_path / "nested" / "out.json"
+    save_json(f, {"a": 1})
+    assert json.loads(f.read_text()) == {"a": 1}
 
 
 def test_iso_to_epoch_valid():
     epoch = iso_to_epoch("2025-01-01T00:00:00Z")
+    assert epoch is not None
     assert epoch > 0
-    assert isinstance(epoch, float)
 
 
 def test_iso_to_epoch_invalid():
-    assert iso_to_epoch("not-a-date") == 0
-    assert iso_to_epoch(None) == 0
+    assert iso_to_epoch("not-a-date") is None
+    assert iso_to_epoch(None) is None
 
 
 def test_now_iso_format():
@@ -69,7 +84,6 @@ def test_now_iso_format():
 def test_find_brew_with_which():
     with patch("shutil.which", return_value="/opt/homebrew/bin/brew"):
         with patch("os.path.realpath", return_value="/opt/homebrew/bin/brew"):
-            # Reset cached value
             import brew_guard.config
 
             brew_guard.config._brew_path = None
@@ -90,13 +104,12 @@ def test_find_brew_skips_self():
                 brew_guard.config._brew_path = None
 
 
-# ── Config Validation ────────────────────────────────────────────────
-
-
 def test_validate_config_key_valid():
     assert validate_config_key("quarantine_days") is None
     assert validate_config_key("attestation_check") is None
     assert validate_config_key("strict_no_check_casks") is None
+    assert validate_config_key("block_on_date_resolution_error") is None
+    assert validate_config_key("block_on_lockfile_error") is None
 
 
 def test_validate_config_key_unknown():
@@ -119,7 +132,7 @@ def test_validate_config_value_int():
 
 
 def test_validate_config_value_int_invalid():
-    val, err = validate_config_value("quarantine_days", "abc")
+    _, err = validate_config_value("quarantine_days", "abc")
     assert err is not None
     assert "integer" in err
 
@@ -129,18 +142,15 @@ def test_validate_config_value_bool():
     assert val is True
     assert err is None
 
-    val, err = validate_config_value("attestation_check", "false")
+    val, err = validate_config_value("block_on_lockfile_error", "false")
     assert val is False
     assert err is None
 
 
 def test_validate_config_value_bool_invalid():
-    val, err = validate_config_value("attestation_check", "yes")
+    _, err = validate_config_value("attestation_check", "yes")
     assert err is not None
     assert "true/false" in err
-
-
-# ── Shell Detection ──────────────────────────────────────────────────
 
 
 def test_detect_shell_zsh():
@@ -185,6 +195,7 @@ def test_check_alias_in_rc_not_found(tmp_path):
     with patch("brew_guard.config.get_rc_file", return_value=rc):
         found, path = check_alias_in_rc()
         assert found is False
+        assert path == rc
 
 
 def test_check_alias_in_rc_double_quotes(tmp_path):

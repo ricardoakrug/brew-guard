@@ -1,0 +1,7 @@
+{
+  "quarantine_days": 3,
+  "attestation_check": false,
+  "strict_attestation": false,
+  "strict_no_check_casks": false,
+  "allowed": {}
+}

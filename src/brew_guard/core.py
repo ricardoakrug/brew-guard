@@ -8,10 +8,10 @@ from brew_guard.config import (
     BOTTLE_ARCH_KEYS,
     DATE_CACHE,
     DATE_CACHE_TTL,
+    JsonFileError,
     epoch_now,
     find_brew,
     iso_to_epoch,
-    load_config,
     load_json,
     load_lockfile,
     now_iso,
@@ -53,9 +53,12 @@ def brew_info_installed(is_cask=False) -> dict:
     return {"formulae": [], "casks": []}
 
 
-def brew_outdated() -> dict:
+def brew_outdated(extra_args: list[str] | None = None) -> dict:
+    cmd = [find_brew(), "outdated", "--json=v2"]
+    if extra_args:
+        cmd.extend(extra_args)
     try:
-        r = run([find_brew(), "outdated", "--json=v2"])
+        r = run(cmd)
         if r.returncode == 0:
             return json.loads(r.stdout)
     except (subprocess.TimeoutExpired, json.JSONDecodeError):
@@ -64,12 +67,28 @@ def brew_outdated() -> dict:
 
 
 # ── Date Resolution ──────────────────────────────────────────────────
-def get_formula_last_modified(name: str, pkg_type: str) -> str | None:
-    cache = load_json(DATE_CACHE)
+def _load_date_cache(cache_writes: bool) -> dict:
+    try:
+        return load_json(DATE_CACHE)
+    except JsonFileError:
+        if cache_writes:
+            save_json(DATE_CACHE, {})
+        return {}
+
+
+def get_formula_last_modified(
+    name: str, pkg_type: str, cache_writes: bool = True
+) -> str | None:
+    if not name:
+        return None
+
+    cache = _load_date_cache(cache_writes)
     now_ts = epoch_now()
     entry = cache.get(name)
     if entry and (now_ts - entry.get("fetched_at", 0)) < DATE_CACHE_TTL:
-        return entry.get("last_modified")
+        cached_last_mod = entry.get("last_modified")
+        if iso_to_epoch(cached_last_mod) is not None:
+            return cached_last_mod
 
     letter = name[0].lower()
     if pkg_type == "formula":
@@ -94,11 +113,11 @@ def get_formula_last_modified(name: str, pkg_type: str) -> str | None:
         )
         if r.returncode == 0 and r.stdout.strip():
             last_mod = r.stdout.strip()
-            if last_mod == "null" or not last_mod:
-                return None
-            cache[name] = {"last_modified": last_mod, "fetched_at": now_ts}
-            save_json(DATE_CACHE, cache)
-            return last_mod
+            if last_mod != "null" and iso_to_epoch(last_mod) is not None:
+                if cache_writes:
+                    cache[name] = {"last_modified": last_mod, "fetched_at": now_ts}
+                    save_json(DATE_CACHE, cache)
+                return last_mod
     except subprocess.TimeoutExpired:
         pass
     return None
@@ -130,26 +149,49 @@ def get_pkg_data(info: dict, pkg_type: str) -> dict:
 
 
 # ── Quarantine Check ─────────────────────────────────────────────────
-def check_quarantine(name: str, pkg_type: str, force: bool) -> tuple[bool, list[str]]:
-    cfg = load_config()
+def check_quarantine(
+    name: str,
+    pkg_type: str,
+    force: bool,
+    cfg: dict,
+    *,
+    cache_writes: bool = True,
+) -> tuple[bool, list[str], str]:
     lines: list[str] = []
 
     allowed = cfg.get("allowed", {}).get(name)
     if allowed:
         lines.append(f"  {green('ALLOWED')}: {name} ({dim('reason: ' + allowed)})")
-        return True, lines
+        return True, lines, "allowed"
 
     quarantine_days = cfg.get("quarantine_days", 3)
-    last_mod = get_formula_last_modified(name, pkg_type)
+    last_mod = get_formula_last_modified(name, pkg_type, cache_writes=cache_writes)
+    mod_epoch = iso_to_epoch(last_mod) if last_mod else None
 
-    if not last_mod:
+    if mod_epoch is None:
+        reason = "modification date unavailable"
+        block_on_error = cfg.get("block_on_date_resolution_error", True)
+
+        if force:
+            lines.append(f"  {yellow('--force: bypassing modification-date verification')}")
+            lines.append(f"  {yellow('WARN')}: Cannot determine modification date for {name}")
+            audit_log(AUDIT_LOG, "FORCE_NO_DATE", name, reason)
+            return True, lines, "forced_no_date"
+
+        if block_on_error:
+            lines.append("")
+            lines.append(f"  {red(bold('BLOCKED'))}: Cannot determine modification date for {name}")
+            lines.append("  brew-guard cannot verify quarantine age.")
+            lines.append(f"  Repair: {dim('check gh auth status or try again later')}")
+            lines.append(f"  Override: {dim('brew install --force ' + name)}")
+            audit_log(AUDIT_LOG, "BLOCKED_NO_DATE", name, reason)
+            return False, lines, "blocked_no_date"
+
         lines.append(f"  {yellow('WARN')}: Cannot determine modification date for {name}")
-        audit_log(AUDIT_LOG, "WARN_NO_DATE", name, "modification date unknown")
-        return True, lines
+        audit_log(AUDIT_LOG, "WARN_NO_DATE", name, reason)
+        return True, lines, "warn_no_date"
 
-    mod_epoch = iso_to_epoch(last_mod)
     age_days = int((epoch_now() - mod_epoch) / 86400)
-
     if age_days < quarantine_days:
         remaining = quarantine_days - age_days
         lines.append("")
@@ -167,7 +209,7 @@ def check_quarantine(name: str, pkg_type: str, force: bool) -> tuple[bool, list[
                 name,
                 f"age={age_days}d quarantine={quarantine_days}d",
             )
-            return True, lines
+            return True, lines, "forced_quarantine"
 
         lines.append(f"  Override:  {dim('brew install --force ' + name)}")
         lines.append(f"  Permanent: {dim('brew allow ' + name + ' --reason ...')}")
@@ -177,21 +219,48 @@ def check_quarantine(name: str, pkg_type: str, force: bool) -> tuple[bool, list[
             name,
             f"age={age_days}d quarantine={quarantine_days}d",
         )
-        return False, lines
+        return False, lines, "blocked_quarantine"
 
     msg = f"{name} modified {age_days}d ago (quarantine: {quarantine_days}d)"
     lines.append(f"  {green('OK')}: {msg}")
-    return True, lines
+    return True, lines, "ok"
 
 
 # ── Hash Change Check ────────────────────────────────────────────────
 def check_hash_changes(
-    name: str, info: dict, pkg_type: str, force: bool
-) -> tuple[bool, list[str]]:
-    lf = load_lockfile()
+    name: str, info: dict, pkg_type: str, force: bool, cfg: dict
+) -> tuple[bool, list[str], str]:
+    try:
+        lf = load_lockfile()
+    except JsonFileError as exc:
+        detail = f"{exc.path}: {exc.reason}"
+        block_on_error = cfg.get("block_on_lockfile_error", True)
+
+        if force:
+            lines = [
+                f"  {yellow('--force: bypassing lockfile verification')}",
+                f"  {yellow('WARN')}: Cannot read lockfile ({detail})",
+            ]
+            audit_log(AUDIT_LOG, "FORCE_LOCKFILE", name, detail)
+            return True, lines, "forced_lockfile_error"
+
+        if block_on_error:
+            lines = [
+                "",
+                f"  {red(bold('BLOCKED'))}: Cannot read lockfile for {bold(name)}",
+                f"  {dim(detail)}",
+                f"  Repair: {dim('fix or replace ~/.brew-guard/lockfile.json, then rerun')}",
+            ]
+            audit_log(AUDIT_LOG, "BLOCKED_LOCKFILE", name, detail)
+            return False, lines, "blocked_lockfile_error"
+
+        lines = [f"  {yellow('WARN')}: Cannot read lockfile ({detail}); treating as untracked"]
+        audit_log(AUDIT_LOG, "WARN_LOCKFILE", name, detail)
+        return True, lines, "warn_lockfile_error"
+
     stored = lf.get("packages", {}).get(name)
     if not stored:
-        return True, []
+        return True, [], "ok"
 
     changes: list[str] = []
     pkg_data = get_pkg_data(info, pkg_type)
@@ -224,24 +293,24 @@ def check_hash_changes(
             changes.append(f"cask SHA256: {old_sha[:16]}... -> {new_sha[:16]}...")
 
     if not changes:
-        return True, []
+        return True, [], "ok"
 
     lines = [
         "",
         f"  {red(bold('HASH CHANGE'))} detected for {bold(name)}:",
     ]
-    for c in changes:
-        lines.append(f"    {yellow('->')} {c}")
+    for change in changes:
+        lines.append(f"    {yellow('->')} {change}")
     lines.append("")
     lines.append("  May be legitimate update or supply chain compromise.")
 
     if force:
         lines.append(f"  {yellow('--force: accepting new hashes')}")
         audit_log(AUDIT_LOG, "FORCE_HASH_CHANGE", name, "; ".join(changes))
-        return True, lines
+        return True, lines, "forced_hash_change"
 
     audit_log(AUDIT_LOG, "BLOCKED_HASH_CHANGE", name, "; ".join(changes))
-    return False, lines
+    return False, lines, "blocked_hash_change"
 
 
 # ── Lockfile Update ──────────────────────────────────────────────────
@@ -284,33 +353,33 @@ def batch_update_lockfile(formulae: list[dict], casks: list[dict]) -> tuple[int,
     lf = load_lockfile()
     now = now_iso()
 
-    for f in formulae:
-        name = f.get("name", "")
+    for formula in formulae:
+        name = formula.get("name", "")
         if not name:
             continue
         existing = lf["packages"].get(name, {})
         lf["packages"][name] = {
             "type": "formula",
-            "version": f.get("versions", {}).get("stable", ""),
-            "sha256_bottle": get_bottle_sha(f),
-            "sha256_source": f.get("urls", {}).get("stable", {}).get("checksum", ""),
-            "ruby_source_sha256": f.get("ruby_source_checksum", {}).get("sha256", ""),
-            "tap_git_head": f.get("tap_git_head", ""),
+            "version": formula.get("versions", {}).get("stable", ""),
+            "sha256_bottle": get_bottle_sha(formula),
+            "sha256_source": formula.get("urls", {}).get("stable", {}).get("checksum", ""),
+            "ruby_source_sha256": formula.get("ruby_source_checksum", {}).get("sha256", ""),
+            "tap_git_head": formula.get("tap_git_head", ""),
             "formula_last_commit": "TRUSTED_BASELINE",
             "first_seen": existing.get("first_seen", now),
             "last_verified": now,
         }
 
-    for c in casks:
-        token = c.get("token", "")
+    for cask in casks:
+        token = cask.get("token", "")
         if not token:
             continue
         existing = lf["packages"].get(token, {})
         lf["packages"][token] = {
             "type": "cask",
-            "version": c.get("version", ""),
-            "sha256": c.get("sha256", ""),
-            "url": c.get("url", ""),
+            "version": cask.get("version", ""),
+            "sha256": cask.get("sha256", ""),
+            "url": cask.get("url", ""),
             "formula_last_commit": "TRUSTED_BASELINE",
             "first_seen": existing.get("first_seen", now),
             "last_verified": now,
@@ -321,13 +390,13 @@ def batch_update_lockfile(formulae: list[dict], casks: list[dict]) -> tuple[int,
 
 
 # ── Attestation ──────────────────────────────────────────────────────
-def verify_attestation(name: str, info: dict) -> tuple[bool, list[str]]:
+def verify_attestation(name: str, info: dict) -> tuple[bool, list[str], str]:
     lines: list[str] = []
     pkg_data = get_pkg_data(info, "formula")
     bottle_sha = get_bottle_sha(pkg_data)
     if not bottle_sha:
         lines.append(f"  {yellow('ATTEST')}: no bottle SHA found, skipping")
-        return True, lines
+        return True, lines, "skip"
 
     lines.append(f"  {blue('ATTEST')}: Verifying {name}...")
     try:
@@ -342,12 +411,16 @@ def verify_attestation(name: str, info: dict) -> tuple[bool, list[str]]:
             ],
             timeout=30,
         )
-        if r.returncode == 0:
-            lines.append(f"  {green('ATTEST OK')}")
-            return True, lines
-        else:
-            lines.append(f"  {red('ATTEST FAIL')}")
-            return False, lines
     except subprocess.TimeoutExpired:
-        lines.append(f"  {yellow('ATTEST TIMEOUT')}")
-        return True, lines
+        lines.append(f"  {red('ATTEST TIMEOUT')}")
+        return False, lines, "timeout"
+
+    if r.returncode == 0:
+        lines.append(f"  {green('ATTEST OK')}")
+        return True, lines, "ok"
+
+    lines.append(f"  {red('ATTEST FAIL')}")
+    stderr = r.stderr.strip()
+    if stderr:
+        lines.append(f"  {dim(stderr.splitlines()[0])}")
+    return False, lines, "failure"

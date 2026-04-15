@@ -2,18 +2,20 @@
 
 import json
 import os
+import subprocess
 import sys
+from dataclasses import dataclass, field
 
 from brew_guard.config import (
     AUDIT_LOG,
     CONFIG_FILE,
     LOCKFILE,
+    JsonFileError,
     add_alias_to_rc,
     check_alias_in_rc,
     detect_shell,
     epoch_now,
     find_brew,
-    get_config,
     init,
     iso_to_epoch,
     load_config,
@@ -30,12 +32,63 @@ from brew_guard.core import (
     check_hash_changes,
     check_quarantine,
     detect_type,
-    get_formula_last_modified,
     get_pkg_data,
     update_lockfile_entry,
     verify_attestation,
 )
 from brew_guard.output import audit_log, blue, bold, dim, green, red, yellow
+
+OPTIONS_WITH_VALUES = {
+    "--appdir",
+    "--audio-unit-plugindir",
+    "--bottle-arch",
+    "--cc",
+    "--colorpickerdir",
+    "--dictionarydir",
+    "--fontdir",
+    "--input-methoddir",
+    "--internet-plugindir",
+    "--keyboard-layoutdir",
+    "--language",
+    "--mdimporterdir",
+    "--prefpanedir",
+    "--qlplugindir",
+    "--screen-saverdir",
+    "--servicedir",
+    "--vst-plugindir",
+    "--vst3-plugindir",
+}
+
+OUTDATED_SELECTION_FLAGS = {
+    "--cask",
+    "--casks",
+    "--fetch-HEAD",
+    "--formula",
+    "--formulae",
+    "--greedy",
+    "--greedy-auto-updates",
+    "--greedy-latest",
+    "-g",
+}
+
+
+@dataclass
+class ParsedArgs:
+    flags: list[str]
+    packages: list[str]
+
+
+@dataclass
+class PackageCheck:
+    name: str
+    pkg_type: str | None
+    info: dict | None
+    ok: bool
+    status: str
+    lines: list[str] = field(default_factory=list)
+    forced: bool = False
+    warned: bool = False
+    allowlisted: bool = False
 
 
 # ── Commands ─────────────────────────────────────────────────────────
@@ -66,6 +119,304 @@ def _ask_yn(prompt: str, default: bool = True) -> bool:
     return answer in ("y", "yes")
 
 
+def _split_protected_args(args: list[str]) -> ParsedArgs:
+    flags: list[str] = []
+    packages: list[str] = []
+    i = 0
+    parsing_flags = True
+
+    while i < len(args):
+        arg = args[i]
+        if parsing_flags and arg == "--":
+            parsing_flags = False
+            i += 1
+            continue
+
+        if parsing_flags and arg.startswith("-") and arg != "-":
+            flags.append(arg)
+            if "=" not in arg and arg in OPTIONS_WITH_VALUES and i + 1 < len(args):
+                flags.append(args[i + 1])
+                i += 2
+                continue
+            i += 1
+            continue
+
+        packages.append(arg)
+        i += 1
+
+    return ParsedArgs(flags=flags, packages=packages)
+
+
+def _has_flag(flags: list[str], *names: str) -> bool:
+    return any(name in flags for name in names)
+
+
+def _requested_type_from_flags(flags: list[str]) -> str | None:
+    if _has_flag(flags, "--cask", "--casks"):
+        return "cask"
+    if _has_flag(flags, "--formula", "--formulae"):
+        return "formula"
+    return None
+
+
+def _is_dry_run(flags: list[str]) -> bool:
+    return _has_flag(flags, "--dry-run", "-n")
+
+
+def _extract_outdated_args(flags: list[str]) -> list[str]:
+    return [flag for flag in flags if flag in OUTDATED_SELECTION_FLAGS]
+
+
+def _print_json_error(exc: JsonFileError, repair: str):
+    print(f"{red('Error')}: {exc.path} {exc.reason}")
+    print(f"  Repair: {repair}")
+
+
+def _exit_json_error(exc: JsonFileError, repair: str):
+    _print_json_error(exc, repair)
+    sys.exit(1)
+
+
+def _load_config_or_exit() -> dict:
+    try:
+        return load_config()
+    except JsonFileError as exc:
+        _exit_json_error(exc, "fix or replace ~/.brew-guard/config.json, then rerun")
+
+
+def _load_lockfile_or_exit() -> dict:
+    try:
+        return load_lockfile()
+    except JsonFileError as exc:
+        _exit_json_error(exc, "fix or replace ~/.brew-guard/lockfile.json, then rerun")
+
+
+def _run_passthrough(real_brew: str, subcmd: str | None = None, args: list[str] | None = None):
+    argv = [real_brew]
+    if subcmd:
+        argv.append(subcmd)
+    if args:
+        argv.extend(args)
+    sys.stdout.flush()
+    os.execv(real_brew, argv)
+
+
+def _run_brew_command(real_brew: str, subcmd: str, args: list[str]) -> int:
+    completed = subprocess.run([real_brew, subcmd] + args, check=False)
+    return completed.returncode
+
+
+def _status_for_success(*, forced: bool, warned: bool, allowlisted: bool) -> str:
+    if allowlisted:
+        return green("ALLOWED")
+    if forced:
+        return yellow("FORCED")
+    if warned:
+        return yellow("WARN")
+    return green("OK")
+
+
+def _evaluate_package(
+    name: str,
+    cfg: dict,
+    *,
+    force: bool,
+    requested_type: str | None = None,
+    cache_writes: bool = True,
+) -> PackageCheck:
+    lines: list[str] = []
+    forced = False
+    warned = False
+    allowlisted = False
+
+    info = brew_info(name, is_cask=requested_type == "cask")
+    if not info:
+        lines.append(f"  {red('ERROR')}: Cannot fetch brew info for {name}")
+        if force:
+            lines.append(f"  {yellow('--force: bypassing brew info lookup failure')}")
+            return PackageCheck(
+                name=name,
+                pkg_type=requested_type,
+                info=None,
+                ok=True,
+                status=yellow("FORCED"),
+                lines=lines,
+                forced=True,
+            )
+        return PackageCheck(
+            name=name,
+            pkg_type=requested_type,
+            info=None,
+            ok=False,
+            status=red("BLOCKED: INFO"),
+            lines=lines,
+        )
+
+    pkg_type = requested_type or detect_type(info)
+    if pkg_type == "unknown":
+        lines.append(f"  {red('ERROR')}: Cannot determine type for {name}")
+        if force:
+            lines.append(f"  {yellow('--force: bypassing package type detection failure')}")
+            return PackageCheck(
+                name=name,
+                pkg_type=None,
+                info=info,
+                ok=True,
+                status=yellow("FORCED"),
+                lines=lines,
+                forced=True,
+            )
+        return PackageCheck(
+            name=name,
+            pkg_type=None,
+            info=info,
+            ok=False,
+            status=red("BLOCKED: TYPE"),
+            lines=lines,
+        )
+
+    ok, result_lines, code = check_quarantine(
+        name,
+        pkg_type,
+        force,
+        cfg,
+        cache_writes=cache_writes,
+    )
+    lines.extend(result_lines)
+    if code == "allowed":
+        allowlisted = True
+    if code.startswith("forced_"):
+        forced = True
+    if code.startswith("warn_"):
+        warned = True
+    if not ok:
+        return PackageCheck(
+            name=name,
+            pkg_type=pkg_type,
+            info=info,
+            ok=False,
+            status=red("BLOCKED: QUARANTINE"),
+            lines=lines,
+        )
+
+    ok, result_lines, code = check_hash_changes(name, info, pkg_type, force, cfg)
+    lines.extend(result_lines)
+    if code.startswith("forced_"):
+        forced = True
+    if code.startswith("warn_"):
+        warned = True
+    if not ok:
+        status = "BLOCKED: LOCKFILE" if code == "blocked_lockfile_error" else "BLOCKED: HASH"
+        return PackageCheck(
+            name=name,
+            pkg_type=pkg_type,
+            info=info,
+            ok=False,
+            status=red(status),
+            lines=lines,
+        )
+
+    pkg_data = get_pkg_data(info, pkg_type)
+    if pkg_type == "cask" and pkg_data.get("sha256") == "no_check":
+        lines.append(f"  {yellow('WARN')}: {name} has sha256:no_check — integrity unverifiable")
+        warned = True
+        if cfg.get("strict_no_check_casks", False):
+            if force:
+                forced = True
+                lines.append(f"  {yellow('--force: bypassing strict no_check policy')}")
+                audit_log(AUDIT_LOG, "FORCE_NO_CHECK", name, "sha256:no_check")
+            else:
+                lines.append(f"  {red('BLOCKED')}: strict_no_check_casks enabled")
+                audit_log(AUDIT_LOG, "BLOCKED_NO_CHECK", name, "sha256:no_check")
+                return PackageCheck(
+                    name=name,
+                    pkg_type=pkg_type,
+                    info=info,
+                    ok=False,
+                    status=red("BLOCKED: NO_CHECK"),
+                    lines=lines,
+                )
+
+    if cfg.get("attestation_check", False) and pkg_type == "formula":
+        ok, result_lines, code = verify_attestation(name, info)
+        lines.extend(result_lines)
+        if not ok:
+            if force:
+                forced = True
+                lines.append(f"  {yellow('--force: bypassing attestation verification')}")
+                audit_log(AUDIT_LOG, "FORCE_ATTESTATION", name, code)
+            elif cfg.get("strict_attestation", False):
+                audit_log(AUDIT_LOG, "BLOCKED_ATTESTATION", name, code)
+                return PackageCheck(
+                    name=name,
+                    pkg_type=pkg_type,
+                    info=info,
+                    ok=False,
+                    status=red("BLOCKED: ATTEST"),
+                    lines=lines,
+                )
+            else:
+                warned = True
+                audit_log(AUDIT_LOG, "WARN_ATTESTATION", name, code)
+
+    return PackageCheck(
+        name=name,
+        pkg_type=pkg_type,
+        info=info,
+        ok=True,
+        status=_status_for_success(forced=forced, warned=warned, allowlisted=allowlisted),
+        lines=lines,
+        forced=forced,
+        warned=warned,
+        allowlisted=allowlisted,
+    )
+
+
+def _refresh_tracked_packages(packages: list[PackageCheck]):
+    for package in packages:
+        if package.pkg_type not in {"formula", "cask"}:
+            continue
+
+        info = brew_info(package.name, is_cask=package.pkg_type == "cask") or package.info
+        if info:
+            try:
+                update_lockfile_entry(package.name, package.pkg_type, info)
+            except JsonFileError as exc:
+                print(
+                    f"  {yellow('WARN')}: Installed {package.name}, but state was not updated "
+                    f"({exc.path} {exc.reason})"
+                )
+
+        reason = "all checks ok"
+        if package.allowlisted:
+            reason = "allowlisted"
+        elif package.forced:
+            reason = "checks bypassed with --force"
+        elif package.warned:
+            reason = "passed with warnings"
+        audit_log(AUDIT_LOG, "PASSED", package.name, reason)
+
+
+def _run_checked_command(
+    real_brew: str,
+    subcmd: str,
+    brew_args: list[str],
+    packages: list[PackageCheck],
+    *,
+    message: str,
+    dry_run: bool,
+):
+    print()
+    print(message)
+    returncode = _run_brew_command(real_brew, subcmd, brew_args)
+    if returncode == 0:
+        if dry_run:
+            print(f"{blue('brew-guard')}: Dry run completed. State unchanged.")
+        else:
+            _refresh_tracked_packages(packages)
+    sys.exit(returncode)
+
+
 def cmd_setup():
     import shutil
 
@@ -75,15 +426,16 @@ def cmd_setup():
     lockfile_existed = LOCKFILE.exists()
     existing_packages = set()
     if lockfile_existed:
-        existing_packages = set(load_lockfile().get("packages", {}).keys())
+        try:
+            existing_packages = set(load_lockfile().get("packages", {}).keys())
+        except JsonFileError as exc:
+            _exit_json_error(exc, "fix or replace ~/.brew-guard/lockfile.json, then rerun setup")
 
     print(f"\n{bold('brew-guard setup')}")
     print(f"{'─' * 50}")
 
-    # ── Step 1: Prerequisites ────────────────────────────────────────
     print(f"\n{bold('1. Prerequisites')}\n")
 
-    # Check brew
     try:
         real_brew = find_brew()
         print(f"  {green('✓')} Homebrew found: {dim(real_brew)}")
@@ -92,7 +444,6 @@ def cmd_setup():
         print("    Install: https://brew.sh")
         sys.exit(1)
 
-    # Check gh CLI
     gh_path = shutil.which("gh")
     if not gh_path:
         print(f"  {red('✗')} GitHub CLI (gh) not found")
@@ -101,10 +452,8 @@ def cmd_setup():
         print(f"  {red('brew-guard requires gh to query formula modification dates.')}")
         print("  Install gh first, then re-run: brew-guard setup")
         sys.exit(1)
-    else:
-        print(f"  {green('✓')} GitHub CLI found: {dim(gh_path)}")
+    print(f"  {green('✓')} GitHub CLI found: {dim(gh_path)}")
 
-    # Check gh auth
     r = run(["gh", "auth", "status"], timeout=10)
     if r.returncode == 0:
         print(f"  {green('✓')} GitHub CLI authenticated (5,000 req/hr)")
@@ -120,7 +469,6 @@ def cmd_setup():
             print("  Then re-run: brew-guard setup")
             sys.exit(0)
 
-    # ── Step 2: Shell Alias ──────────────────────────────────────────
     print(f"\n{bold('2. Shell alias')}\n")
 
     alias_found, rc_path = check_alias_in_rc()
@@ -131,10 +479,7 @@ def cmd_setup():
     elif rc_path:
         print(f"  {yellow('!')} No brew alias found in {rc_path.name}")
         print()
-        if shell == "fish":
-            alias_line = "abbr --add brew brew-guard"
-        else:
-            alias_line = "alias brew='brew-guard'"
+        alias_line = "abbr --add brew brew-guard" if shell == "fish" else "alias brew='brew-guard'"
         print(f"    Will add to {rc_path}:")
         print(f"    {dim(alias_line)}")
         print()
@@ -142,6 +487,7 @@ def cmd_setup():
             add_alias_to_rc(rc_path)
             print(f"  {green('✓')} Alias added to {rc_path.name}")
             print(f"    Run: {dim(f'source {rc_path}')} to activate")
+            alias_found = True
         else:
             print(f"  {yellow('Skipped.')} Add manually:")
             print(f"    echo \"{alias_line}\" >> {rc_path}")
@@ -150,7 +496,6 @@ def cmd_setup():
         print("    Add this alias to your shell config manually:")
         print("    alias brew='brew-guard'")
 
-    # ── Step 3: Configuration ────────────────────────────────────────
     print(f"\n{bold('3. Configuration')}\n")
 
     init()
@@ -168,29 +513,36 @@ def cmd_setup():
             q_days_int = 3
 
         strict_casks = _ask_yn(
-            f"  Block casks with sha256:no_check? {dim('(unverifiable downloads)')}", default=False
+            f"  Block casks with sha256:no_check? {dim('(unverifiable downloads)')}",
+            default=False,
         )
 
-        cfg = load_config()
+        cfg = _load_config_or_exit()
         cfg["quarantine_days"] = q_days_int
         cfg["strict_no_check_casks"] = strict_casks
         save_config(cfg)
 
         print(f"\n  {green('✓')} Config saved to {dim(str(CONFIG_FILE))}")
     else:
-        cfg = load_config()
+        cfg = _load_config_or_exit()
         print(f"  Existing config found at {dim(str(CONFIG_FILE))}:")
-        print(f"    quarantine_days:      {cfg.get('quarantine_days', 3)}")
-        print(f"    attestation_check:    {cfg.get('attestation_check', False)}")
-        print(f"    strict_attestation:   {cfg.get('strict_attestation', False)}")
-        print(f"    strict_no_check_casks:{cfg.get('strict_no_check_casks', False)}")
+        print(f"    quarantine_days:              {cfg.get('quarantine_days', 3)}")
+        print(f"    attestation_check:            {cfg.get('attestation_check', False)}")
+        print(f"    strict_attestation:           {cfg.get('strict_attestation', False)}")
+        print(f"    strict_no_check_casks:        {cfg.get('strict_no_check_casks', False)}")
+        print(
+            "    block_on_date_resolution_error:"
+            f" {cfg.get('block_on_date_resolution_error', True)}"
+        )
+        print(
+            f"    block_on_lockfile_error:      {cfg.get('block_on_lockfile_error', True)}"
+        )
         allowed_count = len(cfg.get("allowed", {}))
         if allowed_count:
-            print(f"    allowed:              {allowed_count} package(s)")
+            print(f"    allowed:                      {allowed_count} package(s)")
         print(f"\n  {green('✓')} Keeping existing config")
         print(f"    Change with: {dim('brew-guard config set <key> <value>')}")
 
-    # ── Step 4: Package Scan ─────────────────────────────────────────
     print(f"\n{bold('4. Scanning installed packages')}\n")
 
     print("  Scanning formulae...")
@@ -201,22 +553,24 @@ def cmd_setup():
     cask_data = brew_info_installed(is_cask=True)
     casks = cask_data.get("casks", [])
 
-    fc, cc = batch_update_lockfile(formulae, casks)
+    try:
+        fc, cc = batch_update_lockfile(formulae, casks)
+    except JsonFileError as exc:
+        _exit_json_error(exc, "fix or replace ~/.brew-guard/lockfile.json, then rerun setup")
 
     if existing_packages:
-        new_lf = load_lockfile()
+        new_lf = _load_lockfile_or_exit()
         current_packages = set(new_lf.get("packages", {}).keys())
         new_packages = current_packages - existing_packages
         if new_packages:
             print(f"  {green('+')} {len(new_packages)} new package(s) added")
-            for p in sorted(new_packages):
-                print(f"    {dim('+')} {p}")
+            for package in sorted(new_packages):
+                print(f"    {dim('+')} {package}")
         print(f"  {fc} formulae + {cc} casks total in lockfile")
     else:
         print(f"  {green('✓')} {fc} formulae + {cc} casks recorded in lockfile")
         print(f"  Dates: {blue('TRUSTED_BASELINE')} (existing installs trusted)")
 
-    # ── Step 5: Summary ──────────────────────────────────────────────
     print(f"\n{'─' * 50}")
     print(f"{bold('Setup complete!')}\n")
     gh_ok = r.returncode == 0
@@ -239,239 +593,142 @@ def cmd_setup():
 
 
 def cmd_install(subcmd: str, args: list[str]):
-    force = "--force" in args
-    is_cask = "--cask" in args
-    packages = [a for a in args if not a.startswith("-")]
+    parsed = _split_protected_args(args)
     real_brew = find_brew()
 
-    if not packages:
-        sys.stdout.flush()
-        os.execv(real_brew, [real_brew, subcmd] + args)
+    if not parsed.packages:
+        _run_passthrough(real_brew, subcmd, args)
 
-    blocked: list[str] = []
-    passed: list[str] = []
+    init()
+    cfg = _load_config_or_exit()
+    force = _has_flag(parsed.flags, "--force", "-f")
+    requested_type = _requested_type_from_flags(parsed.flags)
 
-    for pkg in packages:
-        print(f"{bold('brew-guard')}: Checking {bold(pkg)}...")
-
-        info = brew_info(pkg, is_cask=is_cask)
-        if not info:
-            print(f"  {red('ERROR')}: Cannot fetch brew info for {pkg}")
-            blocked.append(pkg)
-            continue
-
-        pkg_type = "cask" if is_cask else detect_type(info)
-        if pkg_type == "unknown":
-            print(f"  {red('ERROR')}: Cannot determine type for {pkg}")
-            blocked.append(pkg)
-            continue
-
-        pkg_data = get_pkg_data(info, pkg_type)
-
-        # Check 1: Quarantine
-        ok, lines = check_quarantine(pkg, pkg_type, force)
-        for line in lines:
+    checked: list[PackageCheck] = []
+    blocked: list[PackageCheck] = []
+    for package in parsed.packages:
+        print(f"{bold('brew-guard')}: Checking {bold(package)}...")
+        result = _evaluate_package(
+            package,
+            cfg,
+            force=force,
+            requested_type=requested_type,
+        )
+        for line in result.lines:
             print(line)
-        if not ok:
-            blocked.append(pkg)
-            continue
-
-        # Check 2: Hash changes
-        ok, lines = check_hash_changes(pkg, info, pkg_type, force)
-        for line in lines:
-            print(line)
-        if not ok:
-            blocked.append(pkg)
-            continue
-
-        # Check 3: no_check cask warning
-        if pkg_type == "cask" and pkg_data.get("sha256") == "no_check":
-            print(f"  {yellow('WARN')}: {pkg} has sha256:no_check — integrity unverifiable")
-            if get_config("strict_no_check_casks", False) and not force:
-                print(f"  {red('BLOCKED')}: strict_no_check_casks enabled")
-                audit_log(AUDIT_LOG, "BLOCKED_NO_CHECK", pkg, "sha256:no_check")
-                blocked.append(pkg)
-                continue
-
-        # Check 4: Attestation (optional)
-        if get_config("attestation_check", False) and pkg_type == "formula":
-            ok, lines = verify_attestation(pkg, info)
-            for line in lines:
-                print(line)
-            if not ok and get_config("strict_attestation", False) and not force:
-                blocked.append(pkg)
-                continue
-
-        update_lockfile_entry(pkg, pkg_type, info)
-        audit_log(AUDIT_LOG, "PASSED", pkg, "all checks ok")
-        passed.append(pkg)
+        checked.append(result)
+        if not result.ok:
+            blocked.append(result)
 
     if blocked and not force:
         print()
         print(f"{red('brew-guard')}: {len(blocked)} package(s) blocked. Use --force to bypass.")
         sys.exit(1)
 
-    print()
-    print(f"{green('brew-guard')}: All checks passed. Installing...")
-    sys.stdout.flush()
-    os.execv(real_brew, [real_brew, subcmd] + args)
+    action = {
+        "install": "Installing...",
+        "reinstall": "Reinstalling...",
+        "upgrade": "Upgrading...",
+    }[subcmd]
+    _run_checked_command(
+        real_brew,
+        subcmd,
+        args,
+        [package for package in checked if package.ok],
+        message=f"{green('brew-guard')}: Checks completed. {action}",
+        dry_run=_is_dry_run(parsed.flags),
+    )
 
 
 def cmd_upgrade(args: list[str]):
-    force = "--force" in args
-    packages = [a for a in args if not a.startswith("-")]
-    passthrough_args = args[:]
-    real_brew = find_brew()
-
-    if packages:
+    parsed = _split_protected_args(args)
+    if parsed.packages:
         cmd_install("upgrade", args)
         return
 
-    outdated = brew_outdated()
+    real_brew = find_brew()
+    force = _has_flag(parsed.flags, "--force", "-f")
+
+    init()
+    cfg = _load_config_or_exit()
+    outdated = brew_outdated(_extract_outdated_args(parsed.flags))
     outdated_formulae = outdated.get("formulae", [])
     outdated_casks = outdated.get("casks", [])
 
-    total = len(outdated_formulae) + len(outdated_casks)
-    if total == 0:
+    pending = [
+        (formula.get("name", ""), "formula")
+        for formula in outdated_formulae
+        if formula.get("name", "")
+    ] + [
+        (cask.get("name", ""), "cask")
+        for cask in outdated_casks
+        if cask.get("name", "")
+    ]
+
+    if not pending:
         print(f"{bold('brew-guard')}: Everything up to date.")
         return
 
-    print(f"{bold('brew-guard')}: Checking {total} outdated package(s)...\n")
+    print(f"{bold('brew-guard')}: Checking {len(pending)} outdated package(s)...\n")
 
-    rows: list[tuple[str, str, str, str, str]] = []
-    blocked_names: list[str] = []
-    clear_names: list[str] = []
+    checked: list[PackageCheck] = []
+    blocked: list[PackageCheck] = []
+    clear: list[PackageCheck] = []
 
-    cfg = load_config()
-    quarantine_days = cfg.get("quarantine_days", 3)
+    for name, pkg_type in pending:
+        print(f"{bold('brew-guard')}: Checking {bold(name)}...")
+        result = _evaluate_package(name, cfg, force=force, requested_type=pkg_type)
+        for line in result.lines:
+            print(line)
+        print(f"  Status: {result.status}")
+        print()
 
-    for f in outdated_formulae:
-        name = f.get("name", "")
-        installed_versions = f.get("installed_versions", [])
-        installed_ver = installed_versions[0] if installed_versions else ""
-        current_ver = f.get("current_version", "")
-
-        last_mod = get_formula_last_modified(name, "formula")
-        if last_mod:
-            age_days = int((epoch_now() - iso_to_epoch(last_mod)) / 86400)
-            age_str = f"{age_days}d"
+        checked.append(result)
+        if result.ok:
+            clear.append(result)
         else:
-            age_days = 999
-            age_str = "?"
+            blocked.append(result)
 
-        allowed = cfg.get("allowed", {}).get(name)
-
-        if allowed:
-            status = green("ALLOWED")
-            clear_names.append(name)
-        elif age_days < quarantine_days:
-            remaining = quarantine_days - age_days
-            status = red(f"QUARANTINE ({remaining}d remaining)")
-            blocked_names.append(name)
-        else:
-            status = green("OK")
-            clear_names.append(name)
-
-        rows.append((name, installed_ver, current_ver, age_str, status))
-
-    for c in outdated_casks:
-        name = c.get("name", "")
-        installed_ver = (
-            c.get("installed_versions", [""])[0] if c.get("installed_versions") else ""
-        )
-        current_ver = c.get("current_version", "")
-
-        last_mod = get_formula_last_modified(name, "cask")
-        if last_mod:
-            age_days = int((epoch_now() - iso_to_epoch(last_mod)) / 86400)
-            age_str = f"{age_days}d"
-        else:
-            age_days = 999
-            age_str = "?"
-
-        allowed = cfg.get("allowed", {}).get(name)
-
-        if allowed:
-            status = green("ALLOWED")
-            clear_names.append(name)
-        elif age_days < quarantine_days:
-            remaining = quarantine_days - age_days
-            status = red(f"QUARANTINE ({remaining}d remaining)")
-            blocked_names.append(name)
-        else:
-            status = green("OK")
-            clear_names.append(name)
-
-        rows.append((name, installed_ver, current_ver, age_str, status))
-
-    # Print table
-    col_w = [
-        max(len("PACKAGE"), max((len(r[0]) for r in rows), default=7)),
-        max(len("INSTALLED"), max((len(r[1]) for r in rows), default=9)),
-        max(len("AVAILABLE"), max((len(r[2]) for r in rows), default=9)),
-        max(len("AGE"), max((len(r[3]) for r in rows), default=3)),
-    ]
-
-    header = (
-        f"  {bold('PACKAGE'):<{col_w[0]+9}s} "
-        f"{bold('INSTALLED'):<{col_w[1]+9}s} "
-        f"{bold('AVAILABLE'):<{col_w[2]+9}s} "
-        f"{bold('AGE'):<{col_w[3]+9}s} "
-        f"{bold('STATUS')}"
+    print(
+        f"{bold('Summary')}: {green(str(len(clear)))} clear, "
+        f"{red(str(len(blocked)))} blocked"
     )
-    print(header)
-    print(f"  {'─' * col_w[0]} {'─' * col_w[1]} {'─' * col_w[2]} {'─' * col_w[3]} {'─' * 20}")
 
-    for name, inst, avail, age, status in rows:
-        print(
-            f"  {name:<{col_w[0]}s} "
-            f"{dim(inst):<{col_w[1]+9}s} "
-            f"{avail:<{col_w[2]}s} "
-            f"{age:<{col_w[3]}s} "
-            f"{status}"
+    if force:
+        _run_checked_command(
+            real_brew,
+            "upgrade",
+            args,
+            checked,
+            message=f"{yellow('--force')}: Upgrading all {len(pending)} package(s)...",
+            dry_run=_is_dry_run(parsed.flags),
+        )
+
+    if blocked:
+        print(f"  Blocked packages were skipped. Override with: {dim('brew upgrade --force')}")
+
+    if clear:
+        _run_checked_command(
+            real_brew,
+            "upgrade",
+            parsed.flags + [package.name for package in clear],
+            clear,
+            message=f"{green('brew-guard')}: Upgrading {len(clear)} clear package(s)...",
+            dry_run=_is_dry_run(parsed.flags),
         )
 
     print()
-    if blocked_names:
-        print(
-            f"  {bold('Summary')}: {green(str(len(clear_names)))} clear, "
-            f"{red(str(len(blocked_names)))} quarantined"
-        )
-        for name in blocked_names:
-            audit_log(AUDIT_LOG, "BLOCKED_QUARANTINE", name, f"quarantine={quarantine_days}d")
-        if not force:
-            print(f"  Quarantined packages must age past {quarantine_days} days.")
-            print(f"  Override: {dim('brew upgrade --force')}")
-    else:
-        print(f"  {bold('Summary')}: {green('All ' + str(len(clear_names)) + ' packages clear')}")
-
-    if force:
-        print()
-        print(f"{yellow('--force')}: Upgrading all {total} packages...")
-        for name in blocked_names:
-            audit_log(
-                AUDIT_LOG, "FORCE_QUARANTINE", name, f"quarantine={quarantine_days}d forced"
-            )
-        sys.stdout.flush()
-        os.execv(real_brew, [real_brew, "upgrade"] + passthrough_args)
-    elif clear_names:
-        print()
-        print(f"{green('brew-guard')}: Upgrading {len(clear_names)} clear package(s)...")
-        sys.stdout.flush()
-        os.execv(real_brew, [real_brew, "upgrade"] + clear_names)
-    else:
-        print()
-        print(f"{red('brew-guard')}: All outdated packages are quarantined. Nothing to upgrade.")
-        sys.exit(1)
+    print(f"{red('brew-guard')}: All outdated packages are blocked. Nothing to upgrade.")
+    sys.exit(1)
 
 
 def cmd_status():
-    lf = load_lockfile()
+    lf = _load_lockfile_or_exit()
     if not lf.get("packages"):
         print("No lockfile found. Run: brew-guard setup")
         sys.exit(1)
 
-    cfg = load_config()
+    cfg = _load_config_or_exit()
     quarantine_days = cfg.get("quarantine_days", 3)
     now_ts = epoch_now()
 
@@ -488,20 +745,24 @@ def cmd_status():
             status = blue("baseline")
         else:
             mod_epoch = iso_to_epoch(last_mod)
-            age_days = int((now_ts - mod_epoch) / 86400)
-            age_str = str(age_days)
-            if age_days < quarantine_days:
-                status = red("QUARANTINE")
+            if mod_epoch is None:
+                age_str = "?"
+                status = yellow("unknown")
             else:
-                status = green("ok")
+                age_days = int((now_ts - mod_epoch) / 86400)
+                age_str = str(age_days)
+                if age_days < quarantine_days:
+                    status = red("QUARANTINE")
+                else:
+                    status = green("ok")
 
         rows.append((name, pkg_type, version, age_str, status))
 
     col_w = [
-        max(len("PACKAGE"), max((len(r[0]) for r in rows), default=7)),
-        max(len("TYPE"), max((len(r[1]) for r in rows), default=4)),
-        max(len("VERSION"), max((len(r[2]) for r in rows), default=7)),
-        max(len("AGE"), max((len(r[3]) for r in rows), default=3)),
+        max(len("PACKAGE"), max((len(row[0]) for row in rows), default=7)),
+        max(len("TYPE"), max((len(row[1]) for row in rows), default=4)),
+        max(len("VERSION"), max((len(row[2]) for row in rows), default=7)),
+        max(len("AGE"), max((len(row[3]) for row in rows), default=3)),
     ]
 
     print(
@@ -513,36 +774,37 @@ def cmd_status():
     )
     print(f"  {'─' * col_w[0]} {'─' * col_w[1]} {'─' * col_w[2]} {'─' * col_w[3]} {'─' * 12}")
 
-    for name, ptype, ver, age, status in rows:
+    for name, pkg_type, version, age, status in rows:
         print(
             f"  {name:<{col_w[0]}s} "
-            f"{dim(ptype):<{col_w[1]+9}s} "
-            f"{ver:<{col_w[2]}s} "
+            f"{dim(pkg_type):<{col_w[1]+9}s} "
+            f"{version:<{col_w[2]}s} "
             f"{age:<{col_w[3]}s} "
             f"{status}"
         )
 
 
 def cmd_audit():
-    lf = load_lockfile()
+    lf = _load_lockfile_or_exit()
     if not lf.get("packages"):
         print("No lockfile found. Run: brew-guard setup")
         sys.exit(1)
 
+    cfg = _load_config_or_exit()
     print(f"{bold('brew-guard audit')}: Re-checking all installed packages...\n")
 
     issues = 0
-    checked = 0
+    checked_count = 0
 
     for name, pkg in sorted(lf["packages"].items()):
         pkg_type = pkg.get("type", "formula")
-        is_cask = pkg_type == "cask"
-        info = brew_info(name, is_cask=is_cask)
+        info = brew_info(name, is_cask=pkg_type == "cask")
         if not info:
+            print(f"  {yellow('WARN')}: Cannot fetch brew info for {name}")
             continue
 
-        checked += 1
-        ok, lines = check_hash_changes(name, info, pkg_type, force=False)
+        checked_count += 1
+        ok, lines, _ = check_hash_changes(name, info, pkg_type, force=False, cfg=cfg)
         if not ok:
             issues += 1
             for line in lines:
@@ -552,10 +814,10 @@ def cmd_audit():
     if issues:
         print(
             f"{bold('Audit complete.')}: "
-            f"{red(str(issues))} hash change(s) detected in {checked} packages"
+            f"{red(str(issues))} hash change(s) detected in {checked_count} packages"
         )
     else:
-        print(f"{bold('Audit complete.')}: {green('No issues')} in {checked} packages")
+        print(f"{bold('Audit complete.')}: {green('No issues')} in {checked_count} packages")
 
 
 def cmd_verify(name: str):
@@ -565,32 +827,31 @@ def cmd_verify(name: str):
 
     print(f"{bold('brew-guard verify')}: {bold(name)}\n")
 
-    lf = load_lockfile()
+    lf = _load_lockfile_or_exit()
     stored = lf.get("packages", {}).get(name)
     if not stored:
         print(f"  {yellow('NOT TRACKED')}: {name} not in lockfile")
         print("  Run: brew-guard setup")
         sys.exit(1)
 
-    pkg_type = stored.get("type", "formula")
-    is_cask = pkg_type == "cask"
-    info = brew_info(name, is_cask=is_cask)
-
-    ok, lines = check_quarantine(name, pkg_type, force=False)
-    for line in lines:
+    cfg = _load_config_or_exit()
+    result = _evaluate_package(
+        name,
+        cfg,
+        force=False,
+        requested_type=stored.get("type", "formula"),
+        cache_writes=False,
+    )
+    for line in result.lines:
         print(line)
-
-    if info:
-        ok, lines = check_hash_changes(name, info, pkg_type, force=False)
-        for line in lines:
-            print(line)
+    print(f"\n  Status: {result.status}")
 
     print(f"\n  {blue('Lockfile entry')}:")
-    for k, v in sorted(stored.items()):
-        val_str = str(v)
+    for key, value in sorted(stored.items()):
+        val_str = str(value)
         if len(val_str) > 60:
             val_str = val_str[:57] + "..."
-        print(f"    {dim(k)}: {val_str}")
+        print(f"    {dim(key)}: {val_str}")
 
 
 def cmd_allow(args: list[str]):
@@ -614,7 +875,8 @@ def cmd_allow(args: list[str]):
         print("Must provide --reason")
         sys.exit(1)
 
-    cfg = load_config()
+    init()
+    cfg = _load_config_or_exit()
     cfg["allowed"][name] = reason
     save_config(cfg)
     print(f"{green('Allowed')}: {bold(name)} ({dim(reason)})")
@@ -623,8 +885,30 @@ def cmd_allow(args: list[str]):
 
 def cmd_config(args: list[str]):
     action = args[0] if args else ""
-    cfg = load_config()
+    if action == "set":
+        if len(args) < 3:
+            print("Usage: brew-guard config set <key> <value>")
+            sys.exit(1)
 
+        init()
+        cfg = _load_config_or_exit()
+        key, raw_val = args[1], args[2]
+        err = validate_config_key(key)
+        if err:
+            print(f"{red('Error')}: {err}")
+            sys.exit(1)
+
+        val, type_err = validate_config_value(key, raw_val)
+        if type_err:
+            print(f"{red('Error')}: {type_err}")
+            sys.exit(1)
+
+        cfg[key] = val
+        save_config(cfg)
+        print(f"Set {bold(key)} = {json.dumps(val)}")
+        return
+
+    cfg = _load_config_or_exit()
     if action == "get":
         key = args[1] if len(args) > 1 else ""
         if key:
@@ -635,39 +919,19 @@ def cmd_config(args: list[str]):
                 print(f"Unknown key: {key}")
         else:
             print(json.dumps(cfg, indent=2))
-    elif action == "set":
-        if len(args) < 3:
-            print("Usage: brew-guard config set <key> <value>")
-            sys.exit(1)
-        key, raw_val = args[1], args[2]
-
-        # Validate key
-        err = validate_config_key(key)
-        if err:
-            print(f"{red('Error')}: {err}")
-            sys.exit(1)
-
-        # Validate and parse value
-        val, type_err = validate_config_value(key, raw_val)
-        if type_err:
-            print(f"{red('Error')}: {type_err}")
-            sys.exit(1)
-
-        cfg[key] = val
-        save_config(cfg)
-        print(f"Set {bold(key)} = {json.dumps(val)}")
     else:
         print(json.dumps(cfg, indent=2))
 
 
 def cmd_help():
-    print(f"""{bold('brew-guard')}: Supply chain protection for Homebrew
+    print(
+        f"""{bold('brew-guard')}: Supply chain protection for Homebrew
 
 {bold('Usage')}: brew-guard <command> [args]
 
 {bold('Protected commands')}:
   install <pkg> [--force] [--cask]  Install with quarantine + hash checks
-  upgrade [<pkg>] [--force]         Upgrade with checks (partial upgrade if some quarantined)
+  upgrade [<pkg>] [--force]         Upgrade with the full verification pipeline
 
 {bold('Management')}:
   setup                             Initialize and scan installed packages
@@ -677,23 +941,22 @@ def cmd_help():
   allow <pkg> --reason '...'        Permanently bypass quarantine
   config [get|set] [key] [value]    View/change configuration
 
-All other commands pass through to brew.
+Help and plain brew passthrough commands do not create ~/.brew-guard files.
 
 {bold('Config keys')}:
-  quarantine_days {dim('(default: 3)')}      Days before formula update is trusted
-  attestation_check {dim('(default: false)')} Verify Sigstore attestations
-  strict_attestation {dim('(default: false)')}Block on attestation failure
-  strict_no_check_casks {dim('(default: false)')}Block casks with sha256:no_check""")
+  quarantine_days {dim('(default: 3)')}               Days before formula update is trusted
+  attestation_check {dim('(default: false)')}          Verify Sigstore attestations
+  strict_attestation {dim('(default: false)')}         Block on attestation failure or timeout
+  strict_no_check_casks {dim('(default: false)')}      Block casks with sha256:no_check
+  block_on_date_resolution_error {dim('(default: true)')} Block if formula age cannot be verified
+  block_on_lockfile_error {dim('(default: true)')}     Block if lockfile.json is invalid"""
+    )
 
 
 # ── Main ─────────────────────────────────────────────────────────────
 def main():
-    init()
-
     if len(sys.argv) < 2:
-        real_brew = find_brew()
-        sys.stdout.flush()
-        os.execv(real_brew, [real_brew])
+        _run_passthrough(find_brew())
 
     subcmd = sys.argv[1]
     rest = sys.argv[2:]
@@ -717,6 +980,4 @@ def main():
     if handler:
         handler()
     else:
-        real_brew = find_brew()
-        sys.stdout.flush()
-        os.execv(real_brew, [real_brew, subcmd] + rest)
+        _run_passthrough(find_brew(), subcmd, rest)
