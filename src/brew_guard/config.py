@@ -1,7 +1,9 @@
 """Constants, paths, brew detection, JSON I/O, config and lockfile management."""
 
+import difflib
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -34,6 +36,15 @@ DEFAULT_CONFIG = {
     "strict_attestation": False,
     "strict_no_check_casks": False,
     "allowed": {},
+}
+
+# Schema for config validation: key -> expected type
+CONFIG_SCHEMA: dict[str, type] = {
+    "quarantine_days": int,
+    "attestation_check": bool,
+    "strict_attestation": bool,
+    "strict_no_check_casks": bool,
+    "allowed": dict,
 }
 
 # ── Brew Detection ────────────────────────────────────────────────────
@@ -138,3 +149,87 @@ def init():
     if not DATE_CACHE.exists():
         save_json(DATE_CACHE, {})
     AUDIT_LOG.touch(exist_ok=True)
+
+
+# ── Config Validation ────────────────────────────────────────────────
+def validate_config_key(key: str) -> str | None:
+    """Return None if key is valid, or an error message if not."""
+    if key in CONFIG_SCHEMA:
+        return None
+    matches = difflib.get_close_matches(key, CONFIG_SCHEMA.keys(), n=1, cutoff=0.6)
+    if matches:
+        return f"Unknown config key: {key}. Did you mean '{matches[0]}'?"
+    valid = ", ".join(sorted(CONFIG_SCHEMA.keys()))
+    return f"Unknown config key: {key}. Valid keys: {valid}"
+
+
+def validate_config_value(key: str, raw: str) -> tuple[int | bool | str, str | None]:
+    """Parse and validate a raw string value for a config key.
+
+    Returns (parsed_value, error_message). error_message is None on success.
+    """
+    expected = CONFIG_SCHEMA.get(key)
+    if expected is int:
+        if raw.isdigit():
+            return int(raw), None
+        return raw, f"'{key}' expects an integer, got '{raw}'"
+    if expected is bool:
+        if raw in ("true", "false"):
+            return raw == "true", None
+        return raw, f"'{key}' expects true/false, got '{raw}'"
+    return raw, None
+
+
+# ── Shell Detection ──────────────────────────────────────────────────
+SHELL_RC_MAP = {
+    "zsh": ".zshrc",
+    "bash": ".bashrc",
+    "fish": "config.fish",
+}
+
+ALIAS_PATTERN = re.compile(r"""alias\s+brew\s*=\s*['"]brew-guard['"]""")
+FISH_ABBR_PATTERN = re.compile(r"""abbr\s+.*brew\s+brew-guard""")
+
+
+def detect_shell() -> str:
+    """Return shell name from $SHELL (e.g., 'zsh', 'bash', 'fish')."""
+    shell_path = os.environ.get("SHELL", "")
+    return os.path.basename(shell_path)
+
+
+def get_rc_file() -> Path | None:
+    """Return path to shell rc file, or None if shell unsupported."""
+    shell = detect_shell()
+    rc_name = SHELL_RC_MAP.get(shell)
+    if not rc_name:
+        return None
+    if shell == "fish":
+        return Path.home() / ".config" / "fish" / rc_name
+    return Path.home() / rc_name
+
+
+def check_alias_in_rc() -> tuple[bool, Path | None]:
+    """Check if brew alias exists in shell rc file.
+
+    Returns (alias_found, rc_path).
+    """
+    rc = get_rc_file()
+    if not rc or not rc.exists():
+        return False, rc
+    content = rc.read_text()
+    shell = detect_shell()
+    if shell == "fish":
+        return bool(FISH_ABBR_PATTERN.search(content)), rc
+    return bool(ALIAS_PATTERN.search(content)), rc
+
+
+def add_alias_to_rc(rc_path: Path) -> bool:
+    """Append brew alias to rc file. Returns True on success."""
+    shell = detect_shell()
+    if shell == "fish":
+        line = "abbr --add brew brew-guard"
+    else:
+        line = "alias brew='brew-guard'"
+    with open(rc_path, "a") as f:
+        f.write(f"\n# brew-guard: intercept brew commands\n{line}\n")
+    return True

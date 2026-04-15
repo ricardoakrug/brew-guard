@@ -6,9 +6,11 @@ import sys
 
 from brew_guard.config import (
     AUDIT_LOG,
-    BREW_GUARD_DIR,
     CONFIG_FILE,
     LOCKFILE,
+    add_alias_to_rc,
+    check_alias_in_rc,
+    detect_shell,
     epoch_now,
     find_brew,
     get_config,
@@ -17,6 +19,8 @@ from brew_guard.config import (
     load_config,
     load_lockfile,
     save_config,
+    validate_config_key,
+    validate_config_value,
 )
 from brew_guard.core import (
     batch_update_lockfile,
@@ -35,40 +39,203 @@ from brew_guard.output import audit_log, blue, bold, dim, green, red, yellow
 
 
 # ── Commands ─────────────────────────────────────────────────────────
+def _ask(prompt: str, default: str = "") -> str:
+    """Prompt user for input with optional default."""
+    if default:
+        prompt = f"{prompt} [{default}]: "
+    else:
+        prompt = f"{prompt}: "
+    try:
+        answer = input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(1)
+    return answer or default
+
+
+def _ask_yn(prompt: str, default: bool = True) -> bool:
+    """Yes/no prompt. Returns bool."""
+    suffix = "[Y/n]" if default else "[y/N]"
+    try:
+        answer = input(f"{prompt} {suffix} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(1)
+    if not answer:
+        return default
+    return answer in ("y", "yes")
+
+
 def cmd_setup():
+    import shutil
+
     from brew_guard.core import run
 
-    print(f"{bold('brew-guard setup')}: Initializing...")
-    init()
-    print(f"  Created {BREW_GUARD_DIR}/")
+    is_first_run = not CONFIG_FILE.exists()
+    lockfile_existed = LOCKFILE.exists()
+    existing_packages = set()
+    if lockfile_existed:
+        existing_packages = set(load_lockfile().get("packages", {}).keys())
 
+    print(f"\n{bold('brew-guard setup')}")
+    print(f"{'─' * 50}")
+
+    # ── Step 1: Prerequisites ────────────────────────────────────────
+    print(f"\n{bold('1. Prerequisites')}\n")
+
+    # Check brew
+    try:
+        real_brew = find_brew()
+        print(f"  {green('✓')} Homebrew found: {dim(real_brew)}")
+    except SystemExit:
+        print(f"  {red('✗')} Homebrew not found")
+        print("    Install: https://brew.sh")
+        sys.exit(1)
+
+    # Check gh CLI
+    gh_path = shutil.which("gh")
+    if not gh_path:
+        print(f"  {red('✗')} GitHub CLI (gh) not found")
+        print("    Install: brew install gh")
+        print()
+        print(f"  {red('brew-guard requires gh to query formula modification dates.')}")
+        print("  Install gh first, then re-run: brew-guard setup")
+        sys.exit(1)
+    else:
+        print(f"  {green('✓')} GitHub CLI found: {dim(gh_path)}")
+
+    # Check gh auth
     r = run(["gh", "auth", "status"], timeout=10)
     if r.returncode == 0:
-        print(f"  {green('OK')}: gh authenticated")
+        print(f"  {green('✓')} GitHub CLI authenticated (5,000 req/hr)")
     else:
-        print(f"  {yellow('WARN')}: gh not authenticated (rate limit: 60 req/hr)")
-        print("  Run: gh auth login")
+        print(f"  {yellow('!')} GitHub CLI not authenticated")
+        print("    Without auth: rate limit is 60 req/hr (will hit limits quickly)")
+        print("    With auth:    rate limit is 5,000 req/hr")
+        print()
+        if _ask_yn("    Continue without authentication?", default=False):
+            print(f"  {yellow('Continuing degraded.')} Run 'gh auth login' later.")
+        else:
+            print(f"\n  Run: {bold('gh auth login')}")
+            print("  Then re-run: brew-guard setup")
+            sys.exit(0)
 
-    print("  Scanning installed formulae...")
+    # ── Step 2: Shell Alias ──────────────────────────────────────────
+    print(f"\n{bold('2. Shell alias')}\n")
+
+    alias_found, rc_path = check_alias_in_rc()
+    shell = detect_shell()
+
+    if alias_found:
+        print(f"  {green('✓')} Alias found in {dim(str(rc_path))}")
+    elif rc_path:
+        print(f"  {yellow('!')} No brew alias found in {rc_path.name}")
+        print()
+        if shell == "fish":
+            alias_line = "abbr --add brew brew-guard"
+        else:
+            alias_line = "alias brew='brew-guard'"
+        print(f"    Will add to {rc_path}:")
+        print(f"    {dim(alias_line)}")
+        print()
+        if _ask_yn("    Add alias now?"):
+            add_alias_to_rc(rc_path)
+            print(f"  {green('✓')} Alias added to {rc_path.name}")
+            print(f"    Run: {dim(f'source {rc_path}')} to activate")
+        else:
+            print(f"  {yellow('Skipped.')} Add manually:")
+            print(f"    echo \"{alias_line}\" >> {rc_path}")
+    else:
+        print(f"  {yellow('!')} Unsupported shell: {shell or 'unknown'}")
+        print("    Add this alias to your shell config manually:")
+        print("    alias brew='brew-guard'")
+
+    # ── Step 3: Configuration ────────────────────────────────────────
+    print(f"\n{bold('3. Configuration')}\n")
+
+    init()
+
+    if is_first_run:
+        print("  Default settings (press Enter to accept defaults):\n")
+        q_days = _ask(
+            f"  Quarantine period in days {dim('(blocks packages modified within this window)')}",
+            default="3",
+        )
+        try:
+            q_days_int = int(q_days)
+        except ValueError:
+            print(f"  {yellow('Invalid number, using default: 3')}")
+            q_days_int = 3
+
+        strict_casks = _ask_yn(
+            f"  Block casks with sha256:no_check? {dim('(unverifiable downloads)')}", default=False
+        )
+
+        cfg = load_config()
+        cfg["quarantine_days"] = q_days_int
+        cfg["strict_no_check_casks"] = strict_casks
+        save_config(cfg)
+
+        print(f"\n  {green('✓')} Config saved to {dim(str(CONFIG_FILE))}")
+    else:
+        cfg = load_config()
+        print(f"  Existing config found at {dim(str(CONFIG_FILE))}:")
+        print(f"    quarantine_days:      {cfg.get('quarantine_days', 3)}")
+        print(f"    attestation_check:    {cfg.get('attestation_check', False)}")
+        print(f"    strict_attestation:   {cfg.get('strict_attestation', False)}")
+        print(f"    strict_no_check_casks:{cfg.get('strict_no_check_casks', False)}")
+        allowed_count = len(cfg.get("allowed", {}))
+        if allowed_count:
+            print(f"    allowed:              {allowed_count} package(s)")
+        print(f"\n  {green('✓')} Keeping existing config")
+        print(f"    Change with: {dim('brew-guard config set <key> <value>')}")
+
+    # ── Step 4: Package Scan ─────────────────────────────────────────
+    print(f"\n{bold('4. Scanning installed packages')}\n")
+
+    print("  Scanning formulae...")
     installed = brew_info_installed()
     formulae = installed.get("formulae", [])
 
-    print("  Scanning installed casks...")
+    print("  Scanning casks...")
     cask_data = brew_info_installed(is_cask=True)
     casks = cask_data.get("casks", [])
 
     fc, cc = batch_update_lockfile(formulae, casks)
 
+    if existing_packages:
+        new_lf = load_lockfile()
+        current_packages = set(new_lf.get("packages", {}).keys())
+        new_packages = current_packages - existing_packages
+        if new_packages:
+            print(f"  {green('+')} {len(new_packages)} new package(s) added")
+            for p in sorted(new_packages):
+                print(f"    {dim('+')} {p}")
+        print(f"  {fc} formulae + {cc} casks total in lockfile")
+    else:
+        print(f"  {green('✓')} {fc} formulae + {cc} casks recorded in lockfile")
+        print(f"  Dates: {blue('TRUSTED_BASELINE')} (existing installs trusted)")
+
+    # ── Step 5: Summary ──────────────────────────────────────────────
+    print(f"\n{'─' * 50}")
+    print(f"{bold('Setup complete!')}\n")
+    gh_ok = r.returncode == 0
+    gh_icon = green("✓") if gh_ok else yellow("!")
+    gh_msg = "authenticated" if gh_ok else "not authenticated (degraded)"
+    alias_icon = green("✓") if alias_found else yellow("!")
+    alias_msg = "active" if alias_found else "needs shell reload or manual add"
+
+    print(f"  {green('✓')} Homebrew     {dim(real_brew)}")
+    print(f"  {gh_icon} GitHub CLI   {gh_msg}")
+    print(f"  {alias_icon} Shell alias  {alias_msg}")
+    print(f"  {green('✓')} Lockfile     {dim(str(LOCKFILE))}")
+    print(f"  {green('✓')} Config       {dim(str(CONFIG_FILE))}")
     print()
-    print(f"{green('Setup complete.')}")
-    print(f"  {fc} formulae + {cc} casks recorded in lockfile")
-    print(f"  Dates: {blue('TRUSTED_BASELINE')} (existing installs trusted)")
-    print("  Future installs/upgrades query GitHub for modification dates")
-    print(f"  Config:   {CONFIG_FILE}")
-    print(f"  Lockfile: {LOCKFILE}")
+    print("  Future installs/upgrades are now checked automatically.")
+    if not alias_found and rc_path:
+        print(f"  {yellow('Reminder')}: reload your shell to activate the alias:")
+        print(f"    source {rc_path}")
     print()
-    print("  Add this alias to your shell config:")
-    print("    alias brew='brew-guard'")
 
 
 def cmd_install(subcmd: str, args: list[str]):
@@ -473,12 +640,19 @@ def cmd_config(args: list[str]):
             print("Usage: brew-guard config set <key> <value>")
             sys.exit(1)
         key, raw_val = args[1], args[2]
-        if raw_val.isdigit():
-            val: str | int | bool = int(raw_val)
-        elif raw_val in ("true", "false"):
-            val = raw_val == "true"
-        else:
-            val = raw_val
+
+        # Validate key
+        err = validate_config_key(key)
+        if err:
+            print(f"{red('Error')}: {err}")
+            sys.exit(1)
+
+        # Validate and parse value
+        val, type_err = validate_config_value(key, raw_val)
+        if type_err:
+            print(f"{red('Error')}: {type_err}")
+            sys.exit(1)
+
         cfg[key] = val
         save_config(cfg)
         print(f"Set {bold(key)} = {json.dumps(val)}")

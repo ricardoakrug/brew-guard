@@ -45,6 +45,14 @@ brew-guard:  Intercepts the command
 
 GitHub queries are cached for 1 hour to avoid rate limiting. The `gh` CLI handles authentication automatically.
 
+## Prerequisites
+
+- **Python 3.10+**
+- **Homebrew** ([brew.sh](https://brew.sh))
+- **GitHub CLI** (`gh`) — used to query formula modification dates
+  - Install: `brew install gh`
+  - Authenticate: `gh auth login` (recommended — 5,000 req/hr vs 60/hr without)
+
 ## Installation
 
 ### With pipx (recommended)
@@ -67,33 +75,25 @@ cd brew-guard
 pip install -e .
 ```
 
-### Shell alias
-
-Add this to your `~/.zshrc` or `~/.bashrc` so brew-guard intercepts all brew commands:
-
-```bash
-alias brew='brew-guard'
-```
-
-Then reload your shell: `source ~/.zshrc`
-
 ## Quick start
 
 ```bash
-# 1. Install brew-guard
+# 1. Install
 pipx install brew-guard
 
-# 2. Set up the alias
-echo "alias brew='brew-guard'" >> ~/.zshrc
-source ~/.zshrc
-
-# 3. Initialize — scans all installed packages as trusted baseline
+# 2. Run guided setup — checks prerequisites, adds shell alias, configures settings
 brew-guard setup
 
-# 4. Use brew as normal — brew-guard protects you transparently
+# 3. Use brew as normal — brew-guard protects you transparently
 brew install something
 brew upgrade
 ```
+
+Setup will walk you through:
+- Verifying `gh` CLI is installed and authenticated
+- Adding the shell alias (`alias brew='brew-guard'`) to your rc file
+- Choosing your quarantine period and security settings
+- Scanning all installed packages as a trusted baseline
 
 ## Commands
 
@@ -135,13 +135,6 @@ brew-guard config set quarantine_days 7
 brew-guard config
 ```
 
-## Requirements
-
-- **Python** 3.10+
-- **Homebrew** (macOS or Linux)
-- **GitHub CLI** (`gh`) — used to query formula modification dates
-  - Authenticated recommended (`gh auth login`) for higher rate limits (5,000/hr vs 60/hr)
-
 ## Data files
 
 | Path | Purpose |
@@ -150,6 +143,19 @@ brew-guard config
 | `~/.brew-guard/lockfile.json` | Package hashes and metadata |
 | `~/.brew-guard/cache/formula_dates.json` | TTL cache for GitHub queries |
 | `~/.brew-guard/cache/audit.log` | Audit trail of all decisions |
+
+## Uninstall
+
+```bash
+# Remove the package
+pipx uninstall brew-guard
+
+# Remove the alias from your shell config (~/.zshrc, ~/.bashrc, etc.)
+# Delete the line: alias brew='brew-guard'
+
+# Optionally remove data files
+rm -rf ~/.brew-guard
+```
 
 ## License
 

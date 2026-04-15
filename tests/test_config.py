@@ -2,10 +2,20 @@
 
 import json
 import os
-from pathlib import Path
 from unittest.mock import patch
 
-from brew_guard.config import find_brew, iso_to_epoch, load_json, now_iso, save_json
+from brew_guard.config import (
+    check_alias_in_rc,
+    detect_shell,
+    find_brew,
+    get_rc_file,
+    iso_to_epoch,
+    load_json,
+    now_iso,
+    save_json,
+    validate_config_key,
+    validate_config_value,
+)
 
 
 def test_load_json_valid(tmp_path):
@@ -78,3 +88,108 @@ def test_find_brew_skips_self():
                 result = find_brew()
                 assert result == "/opt/homebrew/bin/brew"
                 brew_guard.config._brew_path = None
+
+
+# ── Config Validation ────────────────────────────────────────────────
+
+
+def test_validate_config_key_valid():
+    assert validate_config_key("quarantine_days") is None
+    assert validate_config_key("attestation_check") is None
+    assert validate_config_key("strict_no_check_casks") is None
+
+
+def test_validate_config_key_unknown():
+    err = validate_config_key("nonexistent_key")
+    assert err is not None
+    assert "Unknown config key" in err
+
+
+def test_validate_config_key_typo_suggestion():
+    err = validate_config_key("quarantine_day")
+    assert err is not None
+    assert "quarantine_days" in err
+    assert "Did you mean" in err
+
+
+def test_validate_config_value_int():
+    val, err = validate_config_value("quarantine_days", "7")
+    assert val == 7
+    assert err is None
+
+
+def test_validate_config_value_int_invalid():
+    val, err = validate_config_value("quarantine_days", "abc")
+    assert err is not None
+    assert "integer" in err
+
+
+def test_validate_config_value_bool():
+    val, err = validate_config_value("attestation_check", "true")
+    assert val is True
+    assert err is None
+
+    val, err = validate_config_value("attestation_check", "false")
+    assert val is False
+    assert err is None
+
+
+def test_validate_config_value_bool_invalid():
+    val, err = validate_config_value("attestation_check", "yes")
+    assert err is not None
+    assert "true/false" in err
+
+
+# ── Shell Detection ──────────────────────────────────────────────────
+
+
+def test_detect_shell_zsh():
+    with patch.dict(os.environ, {"SHELL": "/bin/zsh"}):
+        assert detect_shell() == "zsh"
+
+
+def test_detect_shell_bash():
+    with patch.dict(os.environ, {"SHELL": "/bin/bash"}):
+        assert detect_shell() == "bash"
+
+
+def test_detect_shell_fish():
+    with patch.dict(os.environ, {"SHELL": "/usr/local/bin/fish"}):
+        assert detect_shell() == "fish"
+
+
+def test_get_rc_file_zsh():
+    with patch.dict(os.environ, {"SHELL": "/bin/zsh"}):
+        rc = get_rc_file()
+        assert rc is not None
+        assert rc.name == ".zshrc"
+
+
+def test_get_rc_file_unsupported():
+    with patch.dict(os.environ, {"SHELL": "/bin/csh"}):
+        assert get_rc_file() is None
+
+
+def test_check_alias_in_rc_found(tmp_path):
+    rc = tmp_path / ".zshrc"
+    rc.write_text("# some config\nalias brew='brew-guard'\n# more config\n")
+    with patch("brew_guard.config.get_rc_file", return_value=rc):
+        found, path = check_alias_in_rc()
+        assert found is True
+        assert path == rc
+
+
+def test_check_alias_in_rc_not_found(tmp_path):
+    rc = tmp_path / ".zshrc"
+    rc.write_text("# some config\n")
+    with patch("brew_guard.config.get_rc_file", return_value=rc):
+        found, path = check_alias_in_rc()
+        assert found is False
+
+
+def test_check_alias_in_rc_double_quotes(tmp_path):
+    rc = tmp_path / ".zshrc"
+    rc.write_text('alias brew="brew-guard"\n')
+    with patch("brew_guard.config.get_rc_file", return_value=rc):
+        found, _ = check_alias_in_rc()
+        assert found is True
