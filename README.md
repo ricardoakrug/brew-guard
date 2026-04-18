@@ -6,7 +6,9 @@ Supply chain protection wrapper for Homebrew. Quarantines recently-modified pack
 
 brew-guard sits between you and `brew`, intercepting `install` and `upgrade` commands. Before any package is installed or upgraded, it:
 
-1. **Quarantine check** — queries GitHub for when the formula was last modified. If the change is too recent (default: 3 days), the install is blocked.
+1. **Quarantine check** — each package has its own quarantine clock:
+   - **Fresh install** (package not yet tracked): queries GitHub for the formula's last-modified date. If the upstream version is younger than `quarantine_days` (default: 3), the install is blocked.
+   - **Upgrade of a tracked package**: the clock starts the first time brew-guard sees the package as outdated. It keeps accumulating even when the upstream version bumps — so packages that publish daily (e.g. `infisical`, `mise`) still clear after `quarantine_days` instead of being blocked forever. A successful upgrade resets the clock.
 2. **Hash tracking** — records SHA256 hashes of bottles, source tarballs, and formula files in a local lockfile. On upgrade, it detects hash changes and alerts you.
 3. **Audit logging** — every decision (pass, block, force-override) is logged to `~/.brew-guard/cache/audit.log`.
 4. **Strict failure handling** — if formula age or lockfile integrity cannot be verified, brew-guard blocks by default instead of silently degrading.
@@ -34,7 +36,7 @@ The quarantine is a speed bump, not a firewall. It significantly raises the bar 
 ## How it works
 
 ```
-You run:     brew install ripgrep
+You run:     brew install ripgrep                (fresh install)
 brew-guard:  Intercepts the command
              ├─ Queries GitHub: "when was ripgrep.rb last modified?"
              ├─ If < 3 days ago → BLOCKED (quarantine)
@@ -42,6 +44,14 @@ brew-guard:  Intercepts the command
              │   ├─ Hash changed → BLOCKED (possible compromise)
              │   └─ Hash unchanged or new package → PASSED
              └─ Updates lockfile, passes through to real brew
+
+You run:     brew upgrade                        (bulk upgrade)
+brew-guard:  For each outdated tracked package
+             ├─ Stamps "first seen outdated" on first observation
+             ├─ age = today − first-seen-outdated
+             ├─ If age < 3 days → QUARANTINE (clock survives version bumps)
+             ├─ If age ≥ 3 days → hash-change check, then upgrade
+             └─ Successful upgrade clears the stamp
 ```
 
 GitHub queries are cached for 1 hour to avoid rate limiting. The `gh` CLI handles authentication automatically. Read-only commands like `help` and plain brew passthroughs do not create `~/.brew-guard` state.
@@ -122,7 +132,7 @@ Stored at `~/.brew-guard/config.json`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `quarantine_days` | int | `3` | Days a formula must age before install is allowed |
+| `quarantine_days` | int | `3` | Days a formula must age before install/upgrade is allowed. For fresh installs: measured from the upstream commit date. For upgrades of tracked packages: measured from when brew-guard first saw the package as outdated (preserved across upstream version bumps; cleared on successful upgrade) |
 | `attestation_check` | bool | `false` | Verify Sigstore attestations for bottles |
 | `strict_attestation` | bool | `false` | Block on attestation failure or timeout (requires `attestation_check`) |
 | `strict_no_check_casks` | bool | `false` | Block casks that have `sha256 :no_check` |

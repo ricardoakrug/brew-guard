@@ -149,6 +149,34 @@ def get_pkg_data(info: dict, pkg_type: str) -> dict:
 
 
 # ── Quarantine Check ─────────────────────────────────────────────────
+def _get_tracked_entry(name: str) -> dict | None:
+    try:
+        lf = load_lockfile()
+    except JsonFileError:
+        return None
+    return lf.get("packages", {}).get(name)
+
+
+def _stamp_first_outdated_seen(name: str) -> str | None:
+    try:
+        lf = load_lockfile()
+    except JsonFileError:
+        return None
+    entry = lf.get("packages", {}).get(name)
+    if not entry:
+        return None
+    stamp = entry.get("first_outdated_seen")
+    if stamp:
+        return stamp
+    stamp = now_iso()
+    entry["first_outdated_seen"] = stamp
+    try:
+        save_lockfile(lf)
+    except JsonFileError:
+        return None
+    return stamp
+
+
 def check_quarantine(
     name: str,
     pkg_type: str,
@@ -165,6 +193,23 @@ def check_quarantine(
         return True, lines, "allowed"
 
     quarantine_days = cfg.get("quarantine_days", 3)
+    tracked = _get_tracked_entry(name)
+
+    if tracked is not None:
+        stamp = tracked.get("first_outdated_seen") or _stamp_first_outdated_seen(name)
+        stamp_epoch = iso_to_epoch(stamp) if stamp else None
+        if stamp_epoch is None:
+            stamp_epoch = epoch_now()
+        age_days = int((epoch_now() - stamp_epoch) / 86400)
+        return _evaluate_quarantine_age(
+            name,
+            age_days,
+            quarantine_days,
+            force,
+            source="outdated",
+            detail=f"first seen outdated: {dim(stamp)}" if stamp else "",
+        )
+
     last_mod = get_formula_last_modified(name, pkg_type, cache_writes=cache_writes)
     mod_epoch = iso_to_epoch(last_mod) if last_mod else None
 
@@ -192,13 +237,36 @@ def check_quarantine(
         return True, lines, "warn_no_date"
 
     age_days = int((epoch_now() - mod_epoch) / 86400)
+    return _evaluate_quarantine_age(
+        name,
+        age_days,
+        quarantine_days,
+        force,
+        source="upstream",
+        detail=f"Last commit: {dim(last_mod)}",
+    )
+
+
+def _evaluate_quarantine_age(
+    name: str,
+    age_days: int,
+    quarantine_days: int,
+    force: bool,
+    *,
+    source: str,
+    detail: str,
+) -> tuple[bool, list[str], str]:
+    lines: list[str] = []
+    phrase = "outdated" if source == "outdated" else "modified"
+
     if age_days < quarantine_days:
         remaining = quarantine_days - age_days
         lines.append("")
-        msg = f"{bold(name)} modified {bold(str(age_days))} day(s) ago"
+        msg = f"{bold(name)} {phrase} {bold(str(age_days))} day(s) ago"
         lines.append(f"  {red(bold('BLOCKED'))}: {msg}")
         lines.append(f"  Quarantine: {quarantine_days}d | Clear in: {remaining}d")
-        lines.append(f"  Last commit: {dim(last_mod)}")
+        if detail:
+            lines.append(f"  {detail}")
         lines.append("")
 
         if force:
@@ -207,7 +275,7 @@ def check_quarantine(
                 AUDIT_LOG,
                 "FORCE_QUARANTINE",
                 name,
-                f"age={age_days}d quarantine={quarantine_days}d",
+                f"{phrase}={age_days}d quarantine={quarantine_days}d",
             )
             return True, lines, "forced_quarantine"
 
@@ -217,11 +285,11 @@ def check_quarantine(
             AUDIT_LOG,
             "BLOCKED_QUARANTINE",
             name,
-            f"age={age_days}d quarantine={quarantine_days}d",
+            f"{phrase}={age_days}d quarantine={quarantine_days}d",
         )
         return False, lines, "blocked_quarantine"
 
-    msg = f"{name} modified {age_days}d ago (quarantine: {quarantine_days}d)"
+    msg = f"{name} {phrase} {age_days}d ago (quarantine: {quarantine_days}d)"
     lines.append(f"  {green('OK')}: {msg}")
     return True, lines, "ok"
 
@@ -347,6 +415,36 @@ def update_lockfile_entry(name: str, pkg_type: str, info: dict):
 
     lf["packages"][name] = entry
     save_lockfile(lf)
+
+
+def stamp_outdated_seen(names: list[str]) -> int:
+    """Stamp first_outdated_seen=now on any tracked entries that lack it.
+
+    Returns number of entries newly stamped. Silent on lockfile errors
+    (check_hash_changes reports those via its own code path).
+    """
+    if not names:
+        return 0
+    try:
+        lf = load_lockfile()
+    except JsonFileError:
+        return 0
+    now = now_iso()
+    stamped = 0
+    for name in names:
+        entry = lf.get("packages", {}).get(name)
+        if not entry:
+            continue
+        if entry.get("first_outdated_seen"):
+            continue
+        entry["first_outdated_seen"] = now
+        stamped += 1
+    if stamped:
+        try:
+            save_lockfile(lf)
+        except JsonFileError:
+            return 0
+    return stamped
 
 
 def batch_update_lockfile(formulae: list[dict], casks: list[dict]) -> tuple[int, int]:

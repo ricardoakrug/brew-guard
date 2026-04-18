@@ -33,6 +33,7 @@ from brew_guard.core import (
     check_quarantine,
     detect_type,
     get_pkg_data,
+    stamp_outdated_seen,
     update_lockfile_entry,
     verify_attestation,
 )
@@ -669,6 +670,8 @@ def cmd_upgrade(args: list[str]):
         print(f"{bold('brew-guard')}: Everything up to date.")
         return
 
+    stamp_outdated_seen([name for name, _ in pending])
+
     print(f"{bold('brew-guard')}: Checking {len(pending)} outdated package(s)...\n")
 
     checked: list[PackageCheck] = []
@@ -738,23 +741,27 @@ def cmd_status():
     for name, pkg in sorted(lf["packages"].items()):
         pkg_type = pkg.get("type", "?")
         version = pkg.get("version", "?")
+        first_outdated = pkg.get("first_outdated_seen")
         last_mod = pkg.get("formula_last_commit", "")
 
-        if not last_mod or last_mod in ("UNKNOWN", "TRUSTED_BASELINE"):
-            age_str = "--"
-            status = blue("baseline")
-        else:
-            mod_epoch = iso_to_epoch(last_mod)
-            if mod_epoch is None:
+        if first_outdated:
+            outdated_epoch = iso_to_epoch(first_outdated)
+            if outdated_epoch is None:
                 age_str = "?"
                 status = yellow("unknown")
             else:
-                age_days = int((now_ts - mod_epoch) / 86400)
+                age_days = int((now_ts - outdated_epoch) / 86400)
                 age_str = str(age_days)
                 if age_days < quarantine_days:
                     status = red("QUARANTINE")
                 else:
                     status = green("ok")
+        elif not last_mod or last_mod in ("UNKNOWN", "TRUSTED_BASELINE"):
+            age_str = "--"
+            status = blue("baseline")
+        else:
+            age_str = "--"
+            status = green("ok")
 
         rows.append((name, pkg_type, version, age_str, status))
 
