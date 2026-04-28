@@ -35,7 +35,7 @@ Issues = "https://github.com/ricardoakrug/brew-guard/issues"
 [project.scripts]
 brew-guard = "brew_guard.cli:main"
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = ["pytest", "ruff"]
 
 [tool.ruff]
